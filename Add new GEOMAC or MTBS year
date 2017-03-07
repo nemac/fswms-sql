@@ -1,0 +1,92 @@
+-- Process for adding new GEOMAC and MTBS year, each piece should be run separately
+
+-- Make new date on MTBS data and populate new field based on year, startmonth and startday
+ALTER TABLE conus_fireperims_2011
+add fire_date date;
+UPDATE conus_fireperims_2011 SET fire_date=to_Date(year::text||'/'||startmonth::text||'/'||startday::text,'YYYY/MM/DD')
+
+-- Import new geomac as table using shp2pgsql
+
+-- Run make valid on the geomac geometries
+update conus_fireperims_geomac_2016_original
+set geom = st_makevalid(geom)
+
+-- Dissolve geomac based on uniquefireid as new table
+CREATE TABLE conus_fireperims_geomac_2016_new AS
+SELECT 
+uniquefire,
+ST_Union(geom) FROM conus_fireperims_geomac_2016_original GROUP BY uniquefire;
+
+-- Create view for new geomac to select uniquefire id, incidentna, min and max perimeterd (date)
+create or replace view vw_new_geomac_metadata as
+select 
+uniquefire,
+incidentna,
+min(perimeterd) as intial_date,
+max(perimeterd) as end_date
+from conus_fireperims_geomac_2016_original group by uniquefire, incidentna
+
+-- Create new table that joins new geomac metadata to newly dissolved polygons
+CREATE TABLE conus_fireperims_geomac_2016_final as
+select 
+vw_new_geomac_metadata.uniquefire as fire_id,
+vw_new_geomac_metadata.incidentna as fire_name,
+vw_new_geomac_metadata.intial_date,
+vw_new_geomac_metadata.end_date,
+conus_fireperims_geomac_2016_new.st_union as geom
+from vw_new_geomac_metadata, conus_fireperims_geomac_2016_new
+where vw_new_geomac_metadata.uniquefire = conus_fireperims_geomac_2016_new.uniquefire
+
+-- Add primary key id and Create spatial index on final geomac perims
+ALTER TABLE conus_fireperims_geomac_2016_final add id SERIAL PRIMARY KEY;
+CREATE INDEX conus_fireperims_geomac_2016_final_gix ON conus_fireperims_geomac_2016_final USING GIST (geom);
+
+-- Add new fire_type field to final geomac
+ALTER TABLE conus_fireperims_geomac_2016_final
+add fire_type character varying(60);
+UPDATE conus_fireperims_geomac_2016_final SET fire_type='WF';
+
+-- IF needed, as date fields to older geomac
+create or replace view vw_2015_geomac_metadata as
+select 
+inc_num,
+fire_name,
+min(perimeterd) as intial_date,
+max(perimeterd) as end_date
+from conus_fireperims_geomac_2015 group by inc_num, fire_name
+
+ALTER TABLE conus_fireperims_geomac_2015
+add fire_date date;
+UPDATE conus_fireperims_geomac_2015 SET fire_date=date_;
+ALTER TABLE conus_fireperims_geomac_2015
+add fire_id character varying;
+UPDATE conus_fireperims_geomac_2015 SET fire_id=inc_num;
+
+-- Add new acres field to final geomac
+ALTER TABLE conus_fireperims_geomac_2016_final
+add acres double precision;
+UPDATE conus_fireperims_geomac_2016_final SET acres=ROUND((ST_AREA(geom::geography) * 0.000247105)::numeric,2);
+
+-- Create view for new geomac or mtbs with fields in order. The MapServer layer will point to this view
+CREATE OR REPLACE VIEW vw_conus_fireperims_geomac_2016 AS
+select
+id,
+fire_name,
+fire_id,
+intial_date as initial_date,
+end_date,
+acres,
+fire_type,
+geom
+from conus_fireperims_geomac_2016
+
+CREATE OR REPLACE VIEW vw_conus_fireperims_2014 AS
+select
+id,
+fire_name,
+fire_id,
+fire_date,
+acres,
+fire_type,
+geom
+from conus_fireperims_geomac_2014
